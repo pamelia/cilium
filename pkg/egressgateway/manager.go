@@ -18,18 +18,17 @@ import (
 	"github.com/cilium/statedb"
 	"github.com/spf13/pflag"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/client-go/util/workqueue"
 
 	"github.com/cilium/cilium/pkg/datapath/linux/config/defines"
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
+	endpointTables "github.com/cilium/cilium/pkg/endpoint/tables"
 	"github.com/cilium/cilium/pkg/identity"
 	identityCache "github.com/cilium/cilium/pkg/identity/cache"
 	"github.com/cilium/cilium/pkg/k8s"
 	cilium_api_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
-	k8sTypes "github.com/cilium/cilium/pkg/k8s/types"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -108,8 +107,8 @@ type Manager struct {
 	// nodesResource allows reading node CRD from k8s.
 	ciliumNodes resource.Resource[*cilium_api_v2.CiliumNode]
 
-	// endpoints allows reading endpoint CRD from k8s.
-	endpoints resource.Resource[*k8sTypes.CiliumEndpoint]
+	// endpoints stores Cilium-managed endpoint metadata.
+	endpoints statedb.Table[*endpointTables.Endpoint]
 
 	// policyConfigs stores policy configs indexed by policyID
 	policyConfigs map[policyID]*PolicyConfig
@@ -165,7 +164,7 @@ type Params struct {
 	PolicyMap6        egressmap.PolicyMap6
 	Policies          resource.Resource[*Policy]
 	Nodes             resource.Resource[*cilium_api_v2.CiliumNode]
-	Endpoints         resource.Resource[*k8sTypes.CiliumEndpoint]
+	Endpoints         statedb.Table[*endpointTables.Endpoint]
 	Sysctl            sysctl.Sysctl
 
 	DB          *statedb.DB
@@ -186,12 +185,8 @@ func NewEgressGatewayManager(p Params) (out struct {
 		return out, nil
 	}
 
-	if dcfg.IdentityAllocationMode != option.IdentityAllocationModeCRD {
+	if !isSupportedIdentityAllocationMode(dcfg.IdentityAllocationMode) {
 		return out, fmt.Errorf("egress gateway is not supported in %s identity allocation mode", dcfg.IdentityAllocationMode)
-	}
-
-	if dcfg.EnableCiliumEndpointSlice {
-		return out, errors.New("egress gateway is not supported in combination with the CiliumEndpointSlice feature")
 	}
 
 	// TODO: refactor config checks for both ipv4 and ipv6, and derive whether the environment supports egress gateway policies for either protocol
@@ -218,6 +213,18 @@ func NewEgressGatewayManager(p Params) (out struct {
 	}
 
 	return out, nil
+}
+
+func isSupportedIdentityAllocationMode(mode string) bool {
+	switch mode {
+	case option.IdentityAllocationModeCRD,
+		option.IdentityAllocationModeKVstore,
+		option.IdentityAllocationModeDoubleWriteReadKVstore,
+		option.IdentityAllocationModeDoubleWriteReadCRD:
+		return true
+	default:
+		return false
+	}
 }
 
 func newEgressGatewayManager(p Params) (*Manager, error) {
@@ -330,20 +337,27 @@ func (manager *Manager) processEvents(ctx context.Context) {
 		manager.reconciliationTrigger.TriggerWithReason("k8s sync done")
 	}
 
-	// here we try to mimic the same exponential backoff retry logic used by
-	// the identity allocator, where the minimum retry timeout is set to 20
-	// milliseconds and the max number of attempts is 16 (so 20ms * 2^16 ==
-	// ~20 minutes)
-	endpointsRateLimit := workqueue.NewTypedItemExponentialFailureRateLimiter[resource.WorkItem](
-		time.Millisecond*20,
-		time.Minute*20,
-	)
-
 	policyEvents := manager.policies.Events(ctx)
 	nodeEvents := manager.ciliumNodes.Events(ctx)
-	endpointEvents := manager.endpoints.Events(ctx, resource.WithRateLimiter(endpointsRateLimit))
+
+	wtxn := manager.db.WriteTxn(manager.endpoints)
+	endpointChanges, err := manager.endpoints.Changes(wtxn)
+	endpointSync, endpointInitWatch := manager.endpoints.Initialized(wtxn)
+	wtxn.Commit()
+	if err != nil {
+		manager.logger.Error("Failed to subscribe to endpoint table changes",
+			logfields.Error, err,
+		)
+		return
+	}
+	maybeTriggerReconcile()
 
 	for {
+		changes, endpointWatch := endpointChanges.Next(manager.db.ReadTxn())
+		for change := range changes {
+			manager.handleEndpointChange(change)
+		}
+
 		select {
 		case <-ctx.Done():
 			return
@@ -366,14 +380,14 @@ func (manager *Manager) processEvents(ctx context.Context) {
 				manager.handleNodeEvent(event)
 			}
 
-		case event := <-endpointEvents:
-			if event.Kind == resource.Sync {
+		case <-endpointInitWatch:
+			if endpointInitWatch != nil {
 				endpointSync = true
+				endpointInitWatch = nil
 				maybeTriggerReconcile()
-				event.Done(nil)
-			} else {
-				manager.handleEndpointEvent(event)
 			}
+
+		case <-endpointWatch:
 		}
 	}
 }
@@ -455,7 +469,7 @@ func (manager *Manager) onDeleteEgressPolicy(policy *Policy) {
 	manager.reconciliationTrigger.TriggerWithReason("policy deleted")
 }
 
-func (manager *Manager) addEndpoint(endpoint *k8sTypes.CiliumEndpoint) error {
+func (manager *Manager) addEndpoint(endpoint *endpointTables.Endpoint) error {
 	var epData *endpointMetadata
 	var err error
 	var identityLabels labels.Labels
@@ -466,17 +480,17 @@ func (manager *Manager) addEndpoint(endpoint *k8sTypes.CiliumEndpoint) error {
 	logger := manager.logger.With(
 		logfields.K8sEndpointName, endpoint.Name,
 		logfields.K8sNamespace, endpoint.Namespace,
-		logfields.K8sUID, endpoint.UID,
+		logfields.EndpointID, endpoint.Key.String(),
 	)
 
-	if endpoint.Identity == nil {
+	if endpoint.Identity == 0 {
 		logger.Warn(
 			"Endpoint is missing identity metadata, skipping update to egress policy.",
 		)
 		return nil
 	}
 
-	if identityLabels, err = manager.getIdentityLabels(uint32(endpoint.Identity.ID)); err != nil {
+	if identityLabels, err = manager.getIdentityLabels(uint32(endpoint.Identity)); err != nil {
 		logger.Warn(
 			"Failed to get identity labels for endpoint",
 			logfields.Error, err,
@@ -512,30 +526,32 @@ func (manager *Manager) addEndpoint(endpoint *k8sTypes.CiliumEndpoint) error {
 	return nil
 }
 
-func (manager *Manager) deleteEndpoint(endpoint *k8sTypes.CiliumEndpoint) {
+func (manager *Manager) deleteEndpoint(endpoint *endpointTables.Endpoint) {
 	manager.Lock()
 	defer manager.Unlock()
 
 	manager.logger.Debug(
-		"Deleted CiliumEndpoint",
+		"Deleted Cilium-managed endpoint",
 		logfields.K8sEndpointName, endpoint.Name,
 		logfields.K8sNamespace, endpoint.Namespace,
-		logfields.K8sUID, endpoint.UID,
+		logfields.EndpointID, endpoint.Key.String(),
 	)
-	delete(manager.epDataStore, endpoint.UID)
+	delete(manager.epDataStore, endpointID(endpoint.Key.String()))
 
 	manager.setEventBitmap(eventDeleteEndpoint)
 	manager.reconciliationTrigger.TriggerWithReason("endpoint deleted")
 }
 
-func (manager *Manager) handleEndpointEvent(event resource.Event[*k8sTypes.CiliumEndpoint]) {
-	endpoint := event.Object
-
-	if event.Kind == resource.Upsert {
-		event.Done(manager.addEndpoint(endpoint))
+func (manager *Manager) handleEndpointChange(change statedb.Change[*endpointTables.Endpoint]) {
+	if change.Deleted {
+		manager.deleteEndpoint(change.Object)
 	} else {
-		manager.deleteEndpoint(endpoint)
-		event.Done(nil)
+		if err := manager.addEndpoint(change.Object); err != nil {
+			manager.logger.Warn("Failed to process endpoint table update",
+				logfields.Error, err,
+				logfields.EndpointID, change.Object.Key.String(),
+			)
+		}
 	}
 }
 

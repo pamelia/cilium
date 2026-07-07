@@ -358,9 +358,9 @@ func (gwc *gatewayConfig) deriveFromPolicyGatewayConfig(manager *Manager, gc *po
 	return nil
 }
 
-func computeEndpointHash(endpointUID types.UID) uint32 {
+func computeEndpointHash(endpointID endpointID) uint32 {
 	h := fnv.New32a()
-	h.Write([]byte(endpointUID))
+	h.Write([]byte(endpointID))
 	return h.Sum32()
 }
 
@@ -370,7 +370,7 @@ func computeEndpointHash(endpointUID types.UID) uint32 {
 // with a boolean value indicating if the CIDR belongs to the excluded ones and
 // the gatewayConfig of the receiver policy.
 // For multigateway policies the gateways are ordered by IP and paired with each
-// endpoint using the hash of the endpoint UID.
+// endpoint using the hash of the endpoint ID.
 func (config *PolicyConfig) forEachEndpointAndCIDR(f func(netip.Addr, netip.Prefix, bool, *gatewayConfig)) {
 	// Sort gateways to get consistent assignments across nodes.
 	slices.SortFunc(config.gatewayConfigs, func(a, b gatewayConfig) int {

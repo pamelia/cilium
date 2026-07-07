@@ -10,10 +10,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/statedb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 
+	endpointTables "github.com/cilium/cilium/pkg/endpoint/tables"
 	cilium_api_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
@@ -228,30 +230,48 @@ func newCEGP(params *policyParams) (*v2.CiliumEgressGatewayPolicy, *PolicyConfig
 	return cegp, policy
 }
 
-func addEndpointAndReconcile(tb testing.TB, egressGatewayManager *Manager, endpoints fakeResource[*k8sTypes.CiliumEndpoint], ep *k8sTypes.CiliumEndpoint) {
+func addEndpointAndReconcile(tb testing.TB, egressGatewayManager *Manager, endpoints statedb.RWTable[*endpointTables.Endpoint], ep *k8sTypes.CiliumEndpoint) {
 	currentRun := egressGatewayManager.reconciliationEventsCount.Load()
-	addEndpoint(tb, endpoints, ep)
+	addEndpoint(tb, egressGatewayManager, endpoints, ep)
 	waitForReconciliationRun(tb, egressGatewayManager, currentRun)
 }
 
-func addEndpoint(tb testing.TB, endpoints fakeResource[*k8sTypes.CiliumEndpoint], ep *k8sTypes.CiliumEndpoint) {
-	endpoints.process(tb, resource.Event[*k8sTypes.CiliumEndpoint]{
-		Kind:   resource.Upsert,
-		Object: ep,
-	})
+func addEndpoint(tb testing.TB, egressGatewayManager *Manager, endpoints statedb.RWTable[*endpointTables.Endpoint], ep *k8sTypes.CiliumEndpoint) {
+	tb.Helper()
+
+	src, err := endpointTables.SourceFromCEP("default", ep)
+	if err != nil {
+		tb.Fatal("Failed to convert endpoint:", err)
+	}
+	wtxn := egressGatewayManager.db.WriteTxn(endpoints)
+	defer wtxn.Abort()
+	_, err = endpointTables.NewWriter(endpoints).Upsert(wtxn, src)
+	if err != nil {
+		tb.Fatal("Failed to upsert endpoint:", err)
+	}
+	wtxn.Commit()
 }
 
-func deleteEndpointAndReconcile(tb testing.TB, egressGatewayManager *Manager, endpoints fakeResource[*k8sTypes.CiliumEndpoint], ep *k8sTypes.CiliumEndpoint) {
+func deleteEndpointAndReconcile(tb testing.TB, egressGatewayManager *Manager, endpoints statedb.RWTable[*endpointTables.Endpoint], ep *k8sTypes.CiliumEndpoint) {
 	currentRun := egressGatewayManager.reconciliationEventsCount.Load()
-	deleteEndpoint(tb, endpoints, ep)
+	deleteEndpoint(tb, egressGatewayManager, endpoints, ep)
 	waitForReconciliationRun(tb, egressGatewayManager, currentRun)
 }
 
-func deleteEndpoint(tb testing.TB, endpoints fakeResource[*k8sTypes.CiliumEndpoint], ep *k8sTypes.CiliumEndpoint) {
-	endpoints.process(tb, resource.Event[*k8sTypes.CiliumEndpoint]{
-		Kind:   resource.Delete,
-		Object: ep,
-	})
+func deleteEndpoint(tb testing.TB, egressGatewayManager *Manager, endpoints statedb.RWTable[*endpointTables.Endpoint], ep *k8sTypes.CiliumEndpoint) {
+	tb.Helper()
+
+	src, err := endpointTables.SourceFromCEP("default", ep)
+	if err != nil {
+		tb.Fatal("Failed to convert endpoint:", err)
+	}
+	wtxn := egressGatewayManager.db.WriteTxn(endpoints)
+	defer wtxn.Abort()
+	_, _, err = endpointTables.NewWriter(endpoints).DeleteSource(wtxn, src.Key)
+	if err != nil {
+		tb.Fatal("Failed to delete endpoint:", err)
+	}
+	wtxn.Commit()
 }
 
 func addNodeAndReconcile(tb testing.TB, k *EgressGatewayTestSuite, egressGatewayManager *Manager, node *cilium_api_v2.CiliumNode) {
